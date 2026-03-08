@@ -59,53 +59,71 @@ const RECOMMENDATION_STAGE_KEYWORDS = [
   "recommendation",
 ];
 
+// Helper — true if text signals an Examining Authority document
+function isEAText(t) {
+  return (
+    t.includes("examining authority") ||
+    t.includes("examining authorities") ||
+    t.includes("examiners") ||
+    t.includes("inspector's report") ||
+    t.includes("inspectors report")
+  );
+}
+
 const TITLE_SCORE_RULES = [
   {
+    weight: 7,
+    test: (t) => isEAText(t) && t.includes("recommendation") && t.includes("report"),
+    reason: '"examining authority" + "recommendation" + "report"',
+  },
+  {
     weight: 6,
-    test: (t) =>
-      (t.includes("examining authority") || t.includes("examining authorities")) &&
-      t.includes("recommendation") &&
-      t.includes("report"),
-    reason: 'title contains "examining authority" + "recommendation" + "report"',
+    // "Examining Authority's Report to the Secretary of State" — the canonical NSIP title
+    test: (t) => isEAText(t) && t.includes("report") && t.includes("secretary of state"),
+    reason: '"examining authority" + "report" + "secretary of state"',
   },
   {
     weight: 5,
-    test: (t) =>
-      (t.includes("examining authority") || t.includes("examining authorities")) &&
-      t.includes("recommendation"),
-    reason: 'title contains "examining authority" + "recommendation"',
+    test: (t) => isEAText(t) && t.includes("recommendation"),
+    reason: '"examining authority" + "recommendation"',
+  },
+  {
+    weight: 5,
+    // Bare "Examining Authority's Report" without further qualifiers
+    test: (t) => isEAText(t) && t.includes("report") && !t.includes("decision letter"),
+    reason: '"examining authority" + "report"',
   },
   {
     weight: 4,
-    test: (t) =>
-      t.includes("recommendation report") || t.includes("inspectors report") ||
-      t.includes("inspector's report"),
-    reason: 'title contains "recommendation report" or "inspector\'s report"',
+    test: (t) => t.includes("recommendation report"),
+    reason: '"recommendation report"',
   },
   {
     weight: 3,
-    test: (t) => t.includes("examining authority") || t.includes("examining authorities"),
-    reason: 'title contains "examining authority"',
+    test: (t) => isEAText(t),
+    reason: '"examining authority"',
   },
   {
     weight: 2,
     test: (t) => t.includes("recommendation"),
-    reason: 'title contains "recommendation"',
+    reason: '"recommendation"',
   },
 ];
 
 const TITLE_PENALTY_RULES = [
   {
+    // Only penalise explicit SoS *decision* documents, NOT the EA report which is addressed *to* the SoS
     penalty: 6,
-    test: (t) => t.includes("secretary of state"),
-    reason: "secretary of state document (not EA report)",
+    test: (t) =>
+      t.includes("secretary of state") &&
+      (t.includes("decision letter") || t.includes("statement of reasons")) &&
+      !isEAText(t),
+    reason: "SoS decision letter/statement (not EA report)",
   },
   {
     penalty: 5,
-    test: (t) =>
-      t.includes("decision letter") ||
-      (t.includes("decision") && !t.includes("recommendation")),
-    reason: "decision document (not EA recommendation)",
+    test: (t) => t.includes("decision letter") && !isEAText(t),
+    reason: "decision letter (not EA report)",
   },
   {
     penalty: 4,
@@ -121,7 +139,7 @@ const TITLE_PENALTY_RULES = [
   {
     penalty: 3,
     test: (t) =>
-      t.includes("notification of decision") && !t.includes("recommendation"),
+      t.includes("notification of decision") && !isEAText(t),
     reason: "notification of decision",
   },
 ];
@@ -410,11 +428,25 @@ function findRecommendationFilterUrl($, docsUrl) {
   });
   if (found && found !== docsUrl) return found;
 
-  // 3. Hardcoded fallback — known NSIP parameter for the EA recommendation
+  // 3. Hardcoded fallbacks — try all known NSIP document-type strings
+  //    The NSIP site uses ?stage-recommendation=<exact document type label>
   const base = docsUrl.split("?")[0];
-  return (
-    `${base}?stage-recommendation=` +
-    encodeURIComponent("Examining Authority's Recommendation Report")
+  // Return the most specific known value; we'll try alternates in the caller
+  return `${base}?stage-recommendation=` +
+    encodeURIComponent("Examining Authority's Report to the Secretary of State");
+}
+
+/** All known filter URL variants for the Recommendation stage. */
+function recommendationFilterCandidates(docsUrl) {
+  const base = docsUrl.split("?")[0];
+  const types = [
+    "Examining Authority's Report to the Secretary of State",
+    "Examining Authority's Recommendation Report",
+    "Recommendation Report",
+    "Examining Authority's Report",
+  ];
+  return types.map(
+    (t) => `${base}?stage-recommendation=${encodeURIComponent(t)}`
   );
 }
 
@@ -464,19 +496,28 @@ async function findEAReportForProject(projectUrl) {
     return null;
   }
 
-  const filterUrl = findRecommendationFilterUrl($, docsUrl);
+  // Step 1a: auto-detected filter URL from DOM
+  const autoFilter = findRecommendationFilterUrl($, docsUrl);
+
+  // Step 1b: build full list of candidate filter URLs (auto-detected first, then hardcoded variants)
+  const candidates = [autoFilter, ...recommendationFilterCandidates(docsUrl)].filter(
+    (u, i, arr) => u && u !== docsUrl && arr.indexOf(u) === i
+  );
+
   let docs = [];
 
-  // Step 1: filtered page (Recommendation stage)
-  if (filterUrl && filterUrl !== docsUrl) {
+  for (const filterUrl of candidates) {
+    if (docs.length > 0) break;
     try {
-      docs = await fetchAllPages(filterUrl);
+      await sleep(REQUEST_DELAY_MS);
+      const fetched = await fetchAllPages(filterUrl);
       if (DEBUG_MODE)
-        process.stderr.write(`  [debug] filterUrl=${filterUrl} → ${docs.length} docs\n`);
-    } catch { /* fall through */ }
+        process.stderr.write(`  [debug] filterUrl=${filterUrl} → ${fetched.length} docs\n`);
+      if (fetched.length > 0) docs = fetched;
+    } catch { /* try next */ }
   }
 
-  // Step 2: fallback — unfiltered, keep only Recommendation-stage rows
+  // Step 2: fallback — unfiltered page, keep only Recommendation-stage rows
   if (docs.length === 0) {
     const all = extractAllDocuments($, docsUrl);
     docs = all.filter((d) => isRecommendationStage(d.stage));
@@ -484,7 +525,7 @@ async function findEAReportForProject(projectUrl) {
       process.stderr.write(`  [debug] fallback: ${all.length} total, ${docs.length} recommendation-stage\n`);
   }
 
-  // Step 3: last resort — score everything
+  // Step 3: last resort — score everything (relies on scoring rules to pick the right doc)
   if (docs.length === 0) {
     docs = extractAllDocuments($, docsUrl);
     if (DEBUG_MODE)
