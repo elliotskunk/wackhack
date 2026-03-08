@@ -359,11 +359,57 @@ function extractFromGenericLinks($, baseUrl) {
 }
 
 /**
- * Run all three extraction strategies and return the first non-empty result.
+ * Strategy D: NSIP section-results list (primary for this site).
+ *
+ * Matches the exact HTML structure:
+ *   <li class="section-results__result">
+ *     <a class="section-results__result-link" href="...">Title</a>
+ *     <div class="section-results__result-meta-data">
+ *       <span data-cy="published-date">28 May 2020</span>
+ *       <span data-cy="published-stage">Decision</span>
+ *       <span data-cy="published-title">Secretary of State's Decision letter...</span>
+ *     </div>
+ *   </li>
+ */
+function extractFromSectionResults($, baseUrl) {
+  const docs = [];
+  $("li.section-results__result").each((_, li) => {
+    const $li = $(li);
+    const $link = $li.find("a").first();
+    if (!$link.length) return;
+
+    const href = $link.attr("href");
+    if (!href) return;
+
+    const rawTitle = $link.text().trim();
+    if (!rawTitle || rawTitle.length < 5) return;
+
+    // Strip "(PDF, 450KB)" style suffix
+    const title = rawTitle
+      .replace(/\s*&nbsp;\s*/gi, " ")
+      .replace(/\s*\(pdf[^)]*\)/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const url = resolveUrl(href, baseUrl);
+    if (!url) return;
+
+    const publishedDate = $li.find('[data-cy="published-date"]').text().trim() || null;
+    const stage = $li.find('[data-cy="published-stage"]').text().trim() || null;
+    const documentType = $li.find('[data-cy="published-title"]').text().trim() || null;
+
+    docs.push({ title, url, publishedDate, stage, documentType });
+  });
+  return docs;
+}
+
+/**
+ * Run all extraction strategies and return the first non-empty result.
  * If debug mode is on, prints a summary of what each strategy found.
  */
 function extractAllDocuments($, baseUrl) {
   const strategies = [
+    { name: "section-results", fn: extractFromSectionResults },
     { name: "table", fn: extractFromTable },
     { name: "definition-list", fn: extractFromDefinitionList },
     { name: "generic-links", fn: extractFromGenericLinks },
@@ -417,7 +463,8 @@ function findDecisionFilterUrl($, docsUrl) {
   });
   if (found && found !== docsUrl) return found;
 
-  // 2. Filter form: look for a checkbox/option with a "decision" value
+  // 2. Filter form: look for the specific SoS decision checkbox
+  //    The NSIP site uses: name="stage-decision", value="Secretary of State's Decision letter and Statement of Reasons"
   $("form").each((_, form) => {
     if (found) return;
     const $form = $(form);
@@ -425,37 +472,45 @@ function findDecisionFilterUrl($, docsUrl) {
       ? resolveUrl($form.attr("action"), docsUrl)
       : docsUrl;
 
-    // Find the input/select whose value or nearby label says "decision"
     $form.find("input[type=checkbox], input[type=radio], option").each((_, input) => {
       if (found) return;
-      const val = normaliseText($(input).attr("value") || "");
+      const val = $(input).attr("value") || "";
+      const valNorm = normaliseText(val);
+
+      // Primary: match the exact NSIP SoS decision checkbox value
+      const isSoSDecision =
+        valNorm.includes("secretary of state") && valNorm.includes("decision");
+
+      // Fallback: bare "decision" value or label
       const labelText = normaliseText(
         $(input).closest("label").text() ||
         $(`label[for='${$(input).attr("id")}']`).text() ||
         $(input).parent().text()
       );
+      const isDecisionOnly =
+        valNorm === "decision" || /^decision(\s*\(\d+\))?$/.test(labelText);
 
-      if (val === "decision" || /^decision(\s*\(\d+\))?$/.test(labelText)) {
+      if (isSoSDecision || isDecisionOnly) {
         const inputName = $(input).attr("name") || "stage";
         const params = new URLSearchParams();
         params.append(inputName, val || "decision");
-        found = `${action}${action.includes("?") ? "&" : "?"}${params.toString()}`;
+        const sep = action.includes("?") ? "&" : "?";
+        const candidate = `${action}${sep}${params.toString()}`;
+        // Prefer the SoS-specific match over a bare "decision" match
+        if (isSoSDecision || !found) {
+          found = candidate;
+        }
       }
     });
   });
   if (found && found !== docsUrl) return found;
 
-  // 3. Try common URL parameter patterns
+  // 3. Hardcoded fallback for the known NSIP URL parameter
   const base = docsUrl.split("?")[0];
-  const candidates = [
-    `${base}?stage=Decision`,
-    `${base}?stage=decision`,
-    `${base}?filters%5Bstage%5D%5B%5D=decision`,  // filters[stage][]=decision
-    `${base}?type=decision`,
-    `${base}?category=decision`,
-  ];
-  // Return the first candidate — caller will verify if it returns useful results
-  return candidates[0];
+  return (
+    `${base}?stage-decision=` +
+    encodeURIComponent("Secretary of State's Decision letter and Statement of Reasons")
+  );
 }
 
 /**
