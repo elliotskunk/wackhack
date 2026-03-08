@@ -3,118 +3,145 @@
 /**
  * fetch-planning-data.js
  *
- * Scrapes a UK Planning Inspectorate NSIP project document library page and
- * returns ONLY the best-matching Secretary of State decision document.
+ * Crawls the UK Planning Inspectorate NSIP site and extracts the single
+ * best-matching Secretary of State decision document for each project.
+ *
+ * Three accepted input URL forms:
+ *
+ *   1. Project search/filter page
+ *      e.g. https://national-infrastructure-consenting.planninginspectorate.gov.uk/project-search?sector=energy&stage=post_decision
+ *      → Discovers every project on the results page (follows pagination),
+ *        then visits each project's documents page.
+ *      → Writes results to sos-decisions.json in the current directory.
+ *
+ *   2. Single project page
+ *      e.g. https://.../projects/EN010085
+ *      → Visits only that project's documents page.
+ *      → Prints the result to stdout.
+ *
+ *   3. Single project documents page
+ *      e.g. https://.../projects/EN010085/documents
+ *      → Scrapes the documents page directly.
+ *      → Prints the result to stdout.
  *
  * Usage:
- *   node fetch-planning-data.js <project-library-url>
- *   node fetch-planning-data.js  (uses the PROJECT_URL constant below)
+ *   node fetch-planning-data.js <url>
  */
 
 const axios = require("axios");
 const cheerio = require("cheerio");
+const fs = require("fs");
+const path = require("path");
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-// Replace with the target NSIP project library URL, or pass it as argv[2].
-const PROJECT_URL =
-  process.argv[2] || "PROJECT_LIBRARY_PAGE_URL";
+const BASE_URL =
+  "https://national-infrastructure-consenting.planninginspectorate.gov.uk";
 
-// Minimum score a document must reach before it is considered a candidate.
-// Tune upward to be stricter, downward to be more lenient.
+const INPUT_URL = process.argv[2] || "";
+
+/** Minimum score before a document is considered a candidate. */
 const MINIMUM_SCORE = 3;
 
-// ---------------------------------------------------------------------------
-// Stage/category keywords that indicate the final decision stage.
-// Matched against the normalised stage/category label on the page.
-// ---------------------------------------------------------------------------
-const DECISION_STAGE_KEYWORDS = [
-  "decision",
-  "recommendation and decision",
-  "recommendation & decision",
-];
+/** Max concurrent project fetches (be respectful to the server). */
+const CONCURRENCY = 3;
+
+/** Milliseconds to wait between HTTP requests. */
+const REQUEST_DELAY_MS = 400;
+
+/** Output file path for multi-project mode. */
+const OUTPUT_FILE = path.join(process.cwd(), "sos-decisions.json");
 
 // ---------------------------------------------------------------------------
-// Title scoring rules.
-// Each rule carries a weight; the weights are additive.
-// Rules are tested against the normalised (lowercase, trimmed) title.
+// Scoring rules
 // ---------------------------------------------------------------------------
+
+/**
+ * Stage/category keywords indicating the final decision stage.
+ * Matched against the normalised stage label from the page.
+ *
+ * NOTE: "decision" is intentionally broad so it also matches the exact
+ * stage label "Decision" used in the NSIP document table.
+ */
+const DECISION_STAGE_KEYWORDS = [
+  "recommendation and decision",
+  "recommendation & decision",
+  // "decision" alone must come last – it's a substring of the above two,
+  // so order doesn't matter for includes(), but keep it explicit.
+  "decision",
+];
+
+/**
+ * Positive title-scoring rules.
+ * Rules are cumulative; a document can match several.
+ */
 const TITLE_SCORE_RULES = [
-  // Highest confidence: both "secretary of state" and "decision" present
   {
     weight: 5,
     test: (t) => t.includes("secretary of state") && t.includes("decision"),
-    reason: 'title contains "secretary of state" and "decision"',
+    reason: 'title contains "secretary of state" + "decision"',
   },
-  // "decision letter" is a very strong signal on its own
   {
     weight: 4,
     test: (t) => t.includes("decision letter"),
     reason: 'title contains "decision letter"',
   },
-  // "letter from the secretary of state" — common phrasing
   {
     weight: 4,
-    test: (t) =>
-      t.includes("letter from the secretary of state"),
+    test: (t) => t.includes("letter from the secretary of state"),
     reason: 'title contains "letter from the secretary of state"',
   },
-  // "decision and statement of reasons" or "decision letter and statement of reasons"
   {
     weight: 3,
-    test: (t) =>
-      t.includes("decision") && t.includes("statement of reasons"),
-    reason: 'title contains "decision" and "statement of reasons"',
+    test: (t) => t.includes("decision") && t.includes("statement of reasons"),
+    reason: 'title contains "decision" + "statement of reasons"',
   },
-  // Plain "secretary of state" in title (weaker on its own)
   {
     weight: 2,
     test: (t) => t.includes("secretary of state"),
     reason: 'title contains "secretary of state"',
   },
-  // Stage bonus: document lives in a decision-related stage
-  // (applied separately in scoreDecisionDocument)
 ];
 
-// ---------------------------------------------------------------------------
-// Penalty rules — subtract from score when these patterns match the title.
-// Keeps recommendation-only documents from being selected unless they also
-// clearly reference the final decision.
-// ---------------------------------------------------------------------------
+/** Penalty rules — reduce score for non-SoS-decision documents. */
 const TITLE_PENALTY_RULES = [
-  // Recommendation report alone (not bundled with the decision)
   {
     penalty: 4,
     test: (t) =>
       /\brecommendation\b/.test(t) &&
       !t.includes("decision") &&
       !t.includes("secretary of state"),
-    reason: "title appears to be a recommendation-only document",
+    reason: "recommendation-only document",
   },
-  // Inspector's report / examining authority report
   {
     penalty: 3,
     test: (t) =>
       t.includes("inspector") &&
       !t.includes("secretary of state") &&
       !t.includes("decision"),
-    reason: "title appears to be an inspector's report, not the SoS decision",
+    reason: "inspector's report (not SoS decision)",
   },
-  // Procedural decisions (e.g. "procedural decision", "rule 8 decision")
   {
     penalty: 5,
     test: (t) =>
-      t.includes("procedural decision") ||
-      /rule\s*[68]\s*decision/.test(t),
-    reason: "title appears to be a procedural decision, not the final SoS decision",
+      t.includes("procedural decision") || /rule\s*[68]\s*decision/.test(t),
+    reason: "procedural decision",
   },
-  // Acceptance decision (pre-examination stage)
   {
     penalty: 4,
-    test: (t) => t.includes("acceptance decision") || t.includes("accepted for examination"),
-    reason: "title appears to be an acceptance decision",
+    test: (t) =>
+      t.includes("acceptance decision") ||
+      t.includes("accepted for examination"),
+    reason: "acceptance decision",
+  },
+  {
+    penalty: 3,
+    test: (t) =>
+      t.includes("notification of decision") &&
+      !t.includes("secretary of state"),
+    reason: "notification of decision (not the SoS decision letter itself)",
   },
 ];
 
@@ -123,8 +150,8 @@ const TITLE_PENALTY_RULES = [
 // ---------------------------------------------------------------------------
 
 /**
- * Returns a lowercase, whitespace-normalised copy of `str`.
- * Safe to call on null/undefined — returns "".
+ * Lowercase + whitespace-normalise a string.
+ * Safe to call on null/undefined.
  *
  * @param {string|null|undefined} str
  * @returns {string}
@@ -135,292 +162,406 @@ function normaliseText(str) {
 }
 
 /**
- * Resolves a potentially relative `href` against `baseUrl`.
+ * Resolve a potentially relative href to an absolute URL.
  *
- * @param {string} href   - The raw href attribute value.
- * @param {string} baseUrl - The page URL used as the base.
- * @returns {string} - Absolute URL.
+ * @param {string} href
+ * @param {string} base
+ * @returns {string|null}
  */
-function resolveUrl(href, baseUrl) {
+function resolveUrl(href, base) {
   if (!href) return null;
   try {
-    return new URL(href, baseUrl).href;
+    return new URL(href, base).href;
   } catch {
-    return href; // return as-is if resolution fails
+    return href;
   }
 }
 
 /**
- * Returns true when the stage/category label suggests this is the
- * final decision stage of the project.
+ * Return true if the stage label indicates the final decision stage.
  *
  * @param {string|null} stage
  * @returns {boolean}
  */
 function isDecisionStage(stage) {
   const s = normaliseText(stage);
+  // Exclude "post-decision" — that is the stage *after* the decision
+  if (s.includes("post-decision") || s.includes("post decision")) return false;
   return DECISION_STAGE_KEYWORDS.some((kw) => s.includes(kw));
 }
 
 /**
- * Scores a candidate document object against the Secretary of State
- * decision heuristics.
+ * Score a document against the SoS decision heuristics.
  *
- * Returns an object:
- *   { score: number, reasons: string[] }
- *
- * @param {{ title: string, stage: string|null }} doc
+ * @param {{ title: string, stage: string|null, documentType: string|null }} doc
  * @returns {{ score: number, reasons: string[] }}
  */
 function scoreDecisionDocument(doc) {
   const title = normaliseText(doc.title);
+  // Also score against documentType if available (NSIP table has a 4th column)
+  const docType = normaliseText(doc.documentType);
+  const combined = `${title} ${docType}`.trim();
+
   const reasons = [];
   let score = 0;
 
-  // Apply positive title rules
   for (const rule of TITLE_SCORE_RULES) {
-    if (rule.test(title)) {
+    if (rule.test(combined)) {
       score += rule.weight;
       reasons.push(`+${rule.weight}: ${rule.reason}`);
     }
   }
 
-  // Apply penalty rules
   for (const rule of TITLE_PENALTY_RULES) {
-    if (rule.test(title)) {
+    if (rule.test(combined)) {
       score -= rule.penalty;
       reasons.push(`-${rule.penalty}: ${rule.reason}`);
     }
   }
 
-  // Stage bonus: +2 if the document is in a decision-related stage
   if (isDecisionStage(doc.stage)) {
     score += 2;
-    reasons.push("+2: document is in a decision-related stage/category");
+    reasons.push("+2: document is in the Decision stage");
   }
 
   return { score, reasons };
 }
 
 /**
- * Returns true when a document's final score makes it a plausible
- * Secretary of State decision.
+ * Pick the best-scoring SoS decision from a list of candidates.
+ * Returns null if nothing meets MINIMUM_SCORE.
  *
- * @param {{ score: number }} scored
- * @returns {boolean}
+ * @param {Array<object>} docs
+ * @returns {object|null}
  */
-function isLikelySecretaryOfStateDecision(scored) {
-  return scored.score >= MINIMUM_SCORE;
+function pickBestDecision(docs) {
+  const scored = docs
+    .map((doc) => {
+      const { score, reasons } = scoreDecisionDocument(doc);
+      return { ...doc, score, matchedReason: reasons.join("; ") };
+    })
+    .filter((d) => d.score >= MINIMUM_SCORE)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      // Tie-break 1: prefer docs in a decision-related stage
+      const aD = isDecisionStage(a.stage) ? 0 : 1;
+      const bD = isDecisionStage(b.stage) ? 0 : 1;
+      if (aD !== bD) return aD - bD;
+      // Tie-break 2: alphabetical (deterministic)
+      return (a.title || "").localeCompare(b.title || "");
+    });
+
+  if (scored.length === 0) return null;
+
+  const best = scored[0];
+  return {
+    title: best.title,
+    url: best.url,
+    publishedDate: best.publishedDate || null,
+    stage: best.stage || null,
+    documentType: best.documentType || null,
+    matchedReason: best.matchedReason,
+    score: best.score,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Page parsing
+// HTTP
+// ---------------------------------------------------------------------------
+
+const httpClient = axios.create({
+  headers: {
+    "User-Agent":
+      "Mozilla/5.0 (compatible; NSIP-SoS-Decision-Scraper/1.0; +research)",
+    Accept: "text/html,application/xhtml+xml",
+    "Accept-Language": "en-GB,en;q=0.9",
+  },
+  timeout: 30_000,
+});
+
+/**
+ * Fetch a URL and return a Cheerio instance.
+ * Throws on HTTP errors.
+ *
+ * @param {string} url
+ * @returns {Promise<cheerio.CheerioAPI>}
+ */
+async function fetchPage(url) {
+  const res = await httpClient.get(url);
+  return cheerio.load(res.data);
+}
+
+/** Simple promise-based sleep. */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------------------------------------------------------------------------
+// Level 1 — Project search/list page
 // ---------------------------------------------------------------------------
 
 /**
- * Extracts all candidate documents from a loaded Cheerio instance.
+ * Scrape all project links from a project search/filter page, following
+ * pagination until exhausted.
  *
- * The Planning Inspectorate document library is structured with stage/category
- * headings (h2, h3, or labelled sections) followed by lists of documents.
- * This function walks every anchor on the page, then attempts to discover
- * the nearest heading to use as the stage label.
+ * The NSIP project list renders rows like:
+ *   <tr>
+ *     <td><a href="/projects/EN010085">Cleve Hill Solar Park</a></td>
+ *     <td>Cleve Hill Solar Park Ltd</td>
+ *     <td>Decided</td>
+ *   </tr>
  *
- * Assumptions about page structure:
- *   - Documents are represented as <a> tags with an href pointing to a PDF
- *     or document viewer page.
- *   - Stage/category labels are present as heading elements (h2/h3) or
- *     elements with class names containing "stage", "category", or "heading"
- *     that precede the document links.
- *   - Published dates, when present, appear in a sibling or parent element
- *     close to the link (e.g. a <td> or <span> with a date-like string).
+ * @param {string} searchUrl
+ * @returns {Promise<Array<{ name: string, projectUrl: string }>>}
+ */
+async function scrapeProjectList(searchUrl) {
+  const projects = [];
+  const seen = new Set();
+  let pageUrl = searchUrl;
+  let pageNum = 1;
+
+  while (pageUrl) {
+    process.stderr.write(`  [list] page ${pageNum}: ${pageUrl}\n`);
+    let $;
+    try {
+      $ = await fetchPage(pageUrl);
+    } catch (err) {
+      process.stderr.write(`  [list] fetch error: ${err.message}\n`);
+      break;
+    }
+
+    // Project links: href matches /projects/XXXXXXXX (letters+digits, no sub-path)
+    $("a[href]").each((_, el) => {
+      const href = $(el).attr("href");
+      if (!href) return;
+      // Match /projects/EN010085 style — no trailing path segment
+      if (!/\/projects\/[A-Z]{2}\d{6}(?:\/)?$/.test(href)) return;
+      const absolute = resolveUrl(href.replace(/\/$/, ""), BASE_URL);
+      if (seen.has(absolute)) return;
+      seen.add(absolute);
+      projects.push({
+        name: $(el).text().trim(),
+        projectUrl: absolute,
+      });
+    });
+
+    // Pagination: look for a "Next" link
+    const $next = $("a[rel='next']").first();
+    if ($next.length) {
+      pageUrl = resolveUrl($next.attr("href"), pageUrl);
+      pageNum++;
+      await sleep(REQUEST_DELAY_MS);
+    } else {
+      // Also try common text-based pagination links
+      let nextHref = null;
+      $("a").each((_, el) => {
+        const t = normaliseText($(el).text());
+        if (t === "next" || t === "next page" || t === "›" || t === "»") {
+          nextHref = $(el).attr("href");
+        }
+      });
+      if (nextHref) {
+        pageUrl = resolveUrl(nextHref, pageUrl);
+        pageNum++;
+        await sleep(REQUEST_DELAY_MS);
+      } else {
+        pageUrl = null;
+      }
+    }
+  }
+
+  return projects;
+}
+
+// ---------------------------------------------------------------------------
+// Level 2 — Project documents page
+// ---------------------------------------------------------------------------
+
+/**
+ * Given a project page URL (e.g. /projects/EN010085), construct the
+ * documents page URL by appending /documents.
  *
- * If the page structure differs significantly, adjust the selectors below.
+ * @param {string} projectUrl
+ * @returns {string}
+ */
+function buildDocumentsUrl(projectUrl) {
+  return projectUrl.replace(/\/$/, "") + "/documents";
+}
+
+/**
+ * On the NSIP documents page there is a left-hand filter sidebar.
+ * Stage filters appear as links whose text is e.g. "Decision (16)".
+ * This function returns the href of the Decision stage filter link,
+ * or null if not found.
  *
  * @param {cheerio.CheerioAPI} $
  * @param {string} baseUrl
- * @returns {Array<{ title, url, publishedDate, stage }>}
+ * @returns {string|null}
  */
-function extractDocuments($, baseUrl) {
-  const docs = [];
+function findDecisionFilterUrl($, baseUrl) {
+  let filterHref = null;
 
   $("a[href]").each((_, el) => {
-    const $el = $(el);
-    const rawTitle = $el.text().trim();
-    const rawHref = $el.attr("href");
-
-    // Skip anchors with no meaningful text or href
-    if (!rawTitle || !rawHref) return;
-    // Skip anchors that look like navigation (very short text, no path)
-    if (rawTitle.length < 4 && !/\w{3}/.test(rawTitle)) return;
-
-    const url = resolveUrl(rawHref, baseUrl);
-
-    // --- Attempt to resolve the stage/category label ---
-    // Walk up the DOM looking for a heading or labelled ancestor.
-    let stage = null;
-
-    // Strategy 1: look for a preceding h2/h3 sibling or a heading inside a
-    // parent section/article element.
-    const $parent = $el.closest("section, article, div, tr");
-    if ($parent.length) {
-      // Check for a heading inside this container
-      const headingInContainer = $parent
-        .find("h2, h3, h4, [class*='stage'], [class*='category'], [class*='heading']")
-        .first()
-        .text()
-        .trim();
-      if (headingInContainer) {
-        stage = headingInContainer;
-      }
-
-      // If no heading found inside, walk upward
-      if (!stage) {
-        let $cursor = $parent;
-        while ($cursor.length && $cursor[0].tagName !== "body") {
-          const $prev = $cursor.prev("h2, h3, h4");
-          if ($prev.length) {
-            stage = $prev.text().trim();
-            break;
-          }
-          $cursor = $cursor.parent();
-        }
-      }
+    if (filterHref) return; // already found
+    const text = normaliseText($(el).text());
+    // Matches "decision (16)" or just "decision" but NOT "post-decision"
+    if (
+      /^decision(\s*\(\d+\))?$/.test(text) ||
+      /^recommendation\s*(and|&)\s*decision(\s*\(\d+\))?$/.test(text)
+    ) {
+      filterHref = resolveUrl($(el).attr("href"), baseUrl);
     }
+  });
 
-    // Strategy 2: look for the nearest preceding heading in the document flow
-    if (!stage) {
-      let $cursor = $el;
-      while ($cursor.length) {
-        $cursor = $cursor.prev();
-        if (!$cursor.length) {
-          $cursor = $cursor.parent();
-          if (!$cursor.length || $cursor[0].tagName === "body") break;
-          continue;
-        }
-        const tag = $cursor[0] && $cursor[0].tagName;
-        if (tag === "h2" || tag === "h3" || tag === "h4") {
-          stage = $cursor.text().trim();
-          break;
-        }
-      }
-    }
+  return filterHref;
+}
 
-    // --- Attempt to find a published date near the link ---
-    let publishedDate = null;
-    const $row = $el.closest("tr");
-    if ($row.length) {
-      // Table layout: look for a date in sibling cells
-      $row.find("td").each((_, td) => {
-        const cellText = $(td).text().trim();
-        if (
-          !publishedDate &&
-          /\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{4}/i.test(
-            cellText
-          )
-        ) {
-          publishedDate = cellText;
-        }
-      });
-    }
+/**
+ * Extract document rows from the NSIP documents table.
+ *
+ * The table on /projects/XXXXX/documents has these columns:
+ *   1. Title (link + optional "From [Author]" sub-line)
+ *   2. Date published
+ *   3. Stage
+ *   4. Document type
+ *
+ * This function also strips "(PDF, NNNkb)" size suffixes from titles.
+ *
+ * @param {cheerio.CheerioAPI} $
+ * @param {string} baseUrl
+ * @returns {Array<{ title, url, publishedDate, stage, documentType }>}
+ */
+function extractDocumentRows($, baseUrl) {
+  const docs = [];
 
-    if (!publishedDate) {
-      // Non-table: check nearby spans/divs for date-like content
-      const $nearestParent = $el.closest("li, div, p");
-      if ($nearestParent.length) {
-        const parentText = $nearestParent.text();
-        const dateMatch = parentText.match(
-          /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{4})\b/i
-        );
-        if (dateMatch) publishedDate = dateMatch[1];
-      }
-    }
+  // The main content table — skip header rows
+  $("table tr").each((_, row) => {
+    const $cells = $(row).find("td");
+    if ($cells.length < 2) return; // header or empty row
 
-    docs.push({
-      title: rawTitle,
-      url,
-      publishedDate: publishedDate || null,
-      stage: stage || null,
-    });
+    const $titleCell = $cells.eq(0);
+    const $link = $titleCell.find("a[href]").first();
+    if (!$link.length) return;
+
+    const rawTitle = $link.text().trim();
+    // Strip PDF size annotation, e.g. " (PDF, 480KB)"
+    const title = rawTitle.replace(/\s*\(pdf[^)]*\)/i, "").trim();
+    const url = resolveUrl($link.attr("href"), baseUrl);
+
+    const publishedDate = $cells.eq(1).text().trim() || null;
+    const stage = $cells.eq(2).text().trim() || null;
+    const documentType = $cells.eq(3).text().trim() || null;
+
+    if (!title || !url) return;
+
+    docs.push({ title, url, publishedDate, stage, documentType });
   });
 
   return docs;
 }
 
+/**
+ * Fetch a project documents page and return the best-matching SoS decision.
+ *
+ * Strategy:
+ *   1. Load the documents page.
+ *   2. Look for a "Decision" filter link in the sidebar → follow it so we
+ *      only see Decision-stage documents (avoids paginating through hundreds
+ *      of unrelated docs).
+ *   3. Extract document rows from the (filtered) table.
+ *   4. If the filtered page is empty or no filter link was found, fall back
+ *      to the unfiltered page and keep only rows where stage === "Decision".
+ *   5. Score remaining documents and return the top pick.
+ *
+ * @param {string} projectUrl   e.g. https://.../projects/EN010085
+ * @returns {Promise<object|null>}
+ */
+async function findSoSDecisionForProject(projectUrl) {
+  const docsUrl = buildDocumentsUrl(projectUrl);
+
+  let $;
+  try {
+    $ = await fetchPage(docsUrl);
+  } catch (err) {
+    process.stderr.write(`    [docs] fetch error for ${docsUrl}: ${err.message}\n`);
+    return null;
+  }
+
+  // Try the Decision stage filter link first
+  const filterUrl = findDecisionFilterUrl($, docsUrl);
+  let docs = [];
+
+  if (filterUrl && filterUrl !== docsUrl) {
+    await sleep(REQUEST_DELAY_MS);
+    try {
+      const $filtered = await fetchPage(filterUrl);
+      docs = extractDocumentRows($filtered, filterUrl);
+    } catch {
+      // Fall through to unfiltered approach
+    }
+  }
+
+  // Fallback: use unfiltered page, restrict to Decision-stage rows only
+  if (docs.length === 0) {
+    const allDocs = extractDocumentRows($, docsUrl);
+    docs = allDocs.filter((d) => isDecisionStage(d.stage));
+  }
+
+  // If still nothing, try the full unfiltered list (last resort — expensive
+  // for large projects but catches edge cases)
+  if (docs.length === 0) {
+    const allDocs = extractDocumentRows($, docsUrl);
+    docs = allDocs;
+  }
+
+  return pickBestDecision(docs);
+}
+
 // ---------------------------------------------------------------------------
-// Main
+// URL mode detection
 // ---------------------------------------------------------------------------
 
 /**
- * Fetches the NSIP project library page and returns the single best-matching
- * Secretary of State decision document, or null if none found above the
- * minimum confidence threshold.
+ * Determine what kind of NSIP URL was passed.
  *
  * @param {string} url
- * @returns {Promise<object|null>}
+ * @returns {"search"|"project"|"documents"|"unknown"}
  */
-async function fetchSoSDecision(url) {
-  let html;
-  try {
-    const res = await axios.get(url, {
-      headers: {
-        // Mimic a browser request; the Planning Inspectorate site may reject
-        // plain axios user-agents.
-        "User-Agent":
-          "Mozilla/5.0 (compatible; NSIP-SoS-Decision-Scraper/1.0)",
-        Accept: "text/html,application/xhtml+xml",
-      },
-      timeout: 30_000,
-    });
-    html = res.data;
-  } catch (err) {
-    throw new Error(`Failed to fetch page: ${err.message}`);
+function detectUrlMode(url) {
+  const u = url.toLowerCase();
+  if (u.includes("/project-search") || u.includes("/projects?")) return "search";
+  if (/\/projects\/[a-z]{2}\d{6}\/documents/.test(u)) return "documents";
+  if (/\/projects\/[a-z]{2}\d{6}/.test(u)) return "project";
+  return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Process an array of items with bounded concurrency.
+ * Calls `fn(item)` for each item, running at most `limit` at a time.
+ *
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T) => Promise<R>} fn
+ * @returns {Promise<R[]>}
+ */
+async function pooledMap(items, limit, fn) {
+  const results = new Array(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i]);
+      await sleep(REQUEST_DELAY_MS);
+    }
   }
 
-  const $ = cheerio.load(html);
-
-  // Extract all documents from the page
-  const allDocs = extractDocuments($, url);
-
-  if (allDocs.length === 0) {
-    console.warn("No documents found on the page. Check the URL or page structure.");
-    return null;
-  }
-
-  // Score every document
-  const scored = allDocs
-    .map((doc) => {
-      const { score, reasons } = scoreDecisionDocument(doc);
-      return { ...doc, score, matchedReason: reasons.join("; ") };
-    })
-    // Keep only those above the minimum threshold
-    .filter(isLikelySecretaryOfStateDecision)
-    // Sort highest score first; break ties by preferring documents in a
-    // decision-related stage, then alphabetically by title for determinism.
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      const aIsDecision = isDecisionStage(a.stage) ? 0 : 1;
-      const bIsDecision = isDecisionStage(b.stage) ? 0 : 1;
-      if (aIsDecision !== bIsDecision) return aIsDecision - bIsDecision;
-      return a.title.localeCompare(b.title);
-    });
-
-  if (scored.length === 0) {
-    console.warn(
-      `No document met the minimum confidence threshold (score >= ${MINIMUM_SCORE}).`
-    );
-    return null;
-  }
-
-  // Return only the top-ranked result in the required shape
-  const best = scored[0];
-  return {
-    title: best.title,
-    url: best.url,
-    publishedDate: best.publishedDate,
-    stage: best.stage,
-    matchedReason: best.matchedReason,
-    score: best.score,
-  };
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,22 +569,111 @@ async function fetchSoSDecision(url) {
 // ---------------------------------------------------------------------------
 
 (async () => {
-  if (!PROJECT_URL || PROJECT_URL === "PROJECT_LIBRARY_PAGE_URL") {
+  if (!INPUT_URL) {
     console.error(
-      "Error: No URL provided.\n" +
-        "Usage: node fetch-planning-data.js <project-library-url>"
+      "Error: No URL provided.\n\n" +
+        "Usage:\n" +
+        "  node fetch-planning-data.js <url>\n\n" +
+        "URL forms accepted:\n" +
+        "  1. Project search page  — crawls all listed projects\n" +
+        "     e.g. https://national-infrastructure-consenting.planninginspectorate.gov.uk/project-search?sector=energy&stage=post_decision\n\n" +
+        "  2. Single project page  — e.g. https://.../projects/EN010085\n\n" +
+        "  3. Project documents page — e.g. https://.../projects/EN010085/documents"
     );
     process.exit(1);
   }
 
-  console.log(`Fetching: ${PROJECT_URL}\n`);
+  const mode = detectUrlMode(INPUT_URL);
 
-  const result = await fetchSoSDecision(PROJECT_URL);
+  // ── Mode 1: Project search/filter page ────────────────────────────────────
+  if (mode === "search" || mode === "unknown") {
+    console.log(`Mode: project search\nInput: ${INPUT_URL}\n`);
 
-  if (result) {
-    console.log("Secretary of State decision document found:\n");
-    console.log(JSON.stringify(result, null, 2));
-  } else {
-    console.log("No Secretary of State decision document found.");
+    process.stderr.write("Collecting project links...\n");
+    const projects = await scrapeProjectList(INPUT_URL);
+
+    if (projects.length === 0) {
+      console.log("No project links found on the search page.");
+      process.exit(0);
+    }
+
+    console.log(`Found ${projects.length} project(s). Fetching decision documents...\n`);
+
+    let done = 0;
+    const results = await pooledMap(projects, CONCURRENCY, async (project) => {
+      const decision = await findSoSDecisionForProject(project.projectUrl);
+      done++;
+      const status = decision ? `score=${decision.score}` : "not found";
+      process.stderr.write(
+        `  [${done}/${projects.length}] ${project.name} — ${status}\n`
+      );
+      return {
+        project: project.name,
+        projectUrl: project.projectUrl,
+        sosDecision: decision,
+      };
+    });
+
+    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(results, null, 2), "utf8");
+    const found = results.filter((r) => r.sosDecision).length;
+    console.log(
+      `\nDone. ${found}/${projects.length} projects have a matched SoS decision.`
+    );
+    console.log(`Results written to: ${OUTPUT_FILE}`);
+    return;
+  }
+
+  // ── Mode 2: Single project page ───────────────────────────────────────────
+  if (mode === "project") {
+    console.log(`Mode: single project\nInput: ${INPUT_URL}\n`);
+    const decision = await findSoSDecisionForProject(INPUT_URL);
+    if (decision) {
+      console.log("Secretary of State decision document found:\n");
+      console.log(JSON.stringify(decision, null, 2));
+    } else {
+      console.log("No Secretary of State decision document found.");
+    }
+    return;
+  }
+
+  // ── Mode 3: Documents page directly ───────────────────────────────────────
+  if (mode === "documents") {
+    console.log(`Mode: documents page\nInput: ${INPUT_URL}\n`);
+    let $;
+    try {
+      $ = await fetchPage(INPUT_URL);
+    } catch (err) {
+      console.error(`Failed to fetch page: ${err.message}`);
+      process.exit(1);
+    }
+
+    // Try Decision filter link first
+    const filterUrl = findDecisionFilterUrl($, INPUT_URL);
+    let docs = [];
+
+    if (filterUrl && filterUrl !== INPUT_URL) {
+      try {
+        const $filtered = await fetchPage(filterUrl);
+        docs = extractDocumentRows($filtered, filterUrl);
+      } catch { /* fall through */ }
+    }
+
+    if (docs.length === 0) {
+      docs = extractDocumentRows($, INPUT_URL).filter((d) =>
+        isDecisionStage(d.stage)
+      );
+    }
+
+    if (docs.length === 0) {
+      docs = extractDocumentRows($, INPUT_URL);
+    }
+
+    const decision = pickBestDecision(docs);
+    if (decision) {
+      console.log("Secretary of State decision document found:\n");
+      console.log(JSON.stringify(decision, null, 2));
+    } else {
+      console.log("No Secretary of State decision document found.");
+    }
   }
 })();
