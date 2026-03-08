@@ -406,15 +406,16 @@ function extractAllDocuments($, baseUrl) {
 function findPlanningDocFilterUrl($, docsUrl) {
   let found = null;
 
-  // 1. Look for a "Developer's Application" anchor (or close variants)
+  // 1. Look for a "Developer's Application" anchor — href contains developers_application
   $("a[href]").each((_, el) => {
     if (found) return;
+    const href = $(el).attr("href") || "";
     const text = normaliseText($(el).text());
     if (
-      /^developer.?s?\s+application(\s*\(\d+\))?$/.test(text) ||
-      /^application(\s*\(\d+\))?$/.test(text)
+      href.includes("developers_application") ||
+      /^developer.?s?\s+application(\s*\(\d+\))?$/.test(text)
     ) {
-      found = resolveUrl($(el).attr("href"), docsUrl);
+      found = resolveUrl(href, docsUrl);
     }
   });
   if (found && found !== docsUrl) return found;
@@ -450,36 +451,32 @@ function findPlanningDocFilterUrl($, docsUrl) {
   return null;  // caller will use hardcoded candidates
 }
 
-/** All known filter URL variants for Developer's Application > Other Documents. */
+/** All known filter URL variants for Developer's Application > Other Documents.
+ *
+ * The NSIP portal uses underscore-separated stage names as query param keys.
+ * Stage "Developer's Application" → param key: developers_application
+ * The value is the document sub-type label, e.g. "Other Documents".
+ * Source: Planning-Inspectorate/applications-service mapQueryToFilterBody.js
+ */
 function planningDocFilterCandidates(docsUrl) {
   const base = docsUrl.split("?")[0];
 
-  // The NSIP portal uses ?stage-<slug>=<document-type-label>
-  // "Developer's Application" is stage slug "developers-application" or "developer-application"
-  // The sub-category is "Other Documents"
-  const stageSlugVariants = [
-    "developers-application",
-    "developer-application",
-    "developer",
-    "application",
-    "pre-application",
-  ];
-  const docTypeVariants = [
-    "Other Documents",
-    "Other",
+  // Primary: correct underscore format confirmed from source code
+  const primary = [
+    `${base}?developers_application=${encodeURIComponent("Other Documents")}`,
+    `${base}?developers_application=${encodeURIComponent("Other")}`,
+    `${base}?developers_application=`,   // all sub-types under Developer's Application
   ];
 
-  const paramVariants = [];
-  for (const slug of stageSlugVariants) {
-    for (const dtype of docTypeVariants) {
-      paramVariants.push(`${base}?stage-${slug}=${encodeURIComponent(dtype)}`);
-    }
-    // Also try just the stage with no sub-type
-    paramVariants.push(`${base}?stage-${slug}=`);
-    paramVariants.push(`${base}?stage=${encodeURIComponent("Developer's Application")}`);
-  }
+  // Fallbacks: alternate casing/naming that might appear on older records
+  const fallback = [
+    `${base}?developers-application=${encodeURIComponent("Other Documents")}`,
+    `${base}?developer_application=${encodeURIComponent("Other Documents")}`,
+    `${base}?stage=${encodeURIComponent("Developer's Application")}`,
+    `${base}?stage=developers_application`,
+  ];
 
-  return [...new Set(paramVariants)];
+  return [...primary, ...fallback];
 }
 
 // ---------------------------------------------------------------------------
