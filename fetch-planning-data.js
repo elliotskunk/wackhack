@@ -597,6 +597,45 @@ function buildDocumentsUrl(projectUrl) {
 }
 
 /**
+ * Fetch all pages of a (potentially paginated) documents URL and return the
+ * combined list of extracted documents. Stops after 10 pages as a safety cap.
+ */
+async function fetchAllPages(startUrl) {
+  const allDocs = [];
+  let pageUrl = startUrl;
+  let page = 0;
+  const MAX_PAGES = 10;
+
+  while (pageUrl && page < MAX_PAGES) {
+    page++;
+    if (page > 1) await sleep(REQUEST_DELAY_MS);
+    let $p;
+    try {
+      $p = await fetchPage(pageUrl);
+    } catch {
+      break;
+    }
+    const pageDocs = extractAllDocuments($p, pageUrl);
+    allDocs.push(...pageDocs);
+
+    // Find next-page link
+    let nextHref = $p("a[rel='next']").attr("href") || null;
+    if (!nextHref) {
+      $p("a").each((_, el) => {
+        if (nextHref) return;
+        const t = normaliseText($p(el).text());
+        if (t === "next" || t === "next page" || t === "›" || t === "»") {
+          nextHref = $p(el).attr("href");
+        }
+      });
+    }
+    pageUrl = nextHref ? resolveUrl(nextHref, pageUrl) : null;
+  }
+
+  return allDocs;
+}
+
+/**
  * Main logic for finding the SoS decision document for one project.
  *
  * Flow:
@@ -633,13 +672,11 @@ async function findSoSDecisionForProject(projectUrl) {
   let docs = [];
 
   if (filterUrl && filterUrl !== docsUrl) {
-    await sleep(REQUEST_DELAY_MS);
     try {
-      const $f = await fetchPage(filterUrl);
-      docs = extractAllDocuments($f, filterUrl);
+      docs = await fetchAllPages(filterUrl);
       if (DEBUG_MODE) {
         process.stderr.write(
-          `  [debug] filterUrl=${filterUrl} → ${docs.length} docs extracted\n`
+          `  [debug] filterUrl=${filterUrl} → ${docs.length} docs extracted (all pages)\n`
         );
       }
     } catch {
@@ -740,8 +777,7 @@ async function pooledMap(items, limit, fn) {
     let docs = [];
     if (filterUrl && filterUrl !== INPUT_URL) {
       try {
-        const $f = await fetchPage(filterUrl);
-        docs = extractAllDocuments($f, filterUrl);
+        docs = await fetchAllPages(filterUrl);
       } catch { /* fall through */ }
     }
     if (docs.length === 0) {
