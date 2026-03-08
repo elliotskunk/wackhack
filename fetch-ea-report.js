@@ -439,15 +439,21 @@ function findRecommendationFilterUrl($, docsUrl) {
 /** All known filter URL variants for the Recommendation stage. */
 function recommendationFilterCandidates(docsUrl) {
   const base = docsUrl.split("?")[0];
-  const types = [
+  // Try both the long document-type value form AND simple stage= forms
+  const longTypes = [
     "Examining Authority's Report to the Secretary of State",
     "Examining Authority's Recommendation Report",
     "Recommendation Report",
     "Examining Authority's Report",
+  ].map((t) => `${base}?stage-recommendation=${encodeURIComponent(t)}`);
+
+  const simpleTypes = [
+    `${base}?stage=recommendation`,
+    `${base}?stage=Recommendation`,
+    `${base}?stage-recommendation=recommendation`,
   ];
-  return types.map(
-    (t) => `${base}?stage-recommendation=${encodeURIComponent(t)}`
-  );
+
+  return [...longTypes, ...simpleTypes];
 }
 
 // ---------------------------------------------------------------------------
@@ -496,10 +502,8 @@ async function findEAReportForProject(projectUrl) {
     return null;
   }
 
-  // Step 1a: auto-detected filter URL from DOM
+  // Step 1: try all filter URL candidates (auto-detected from DOM + hardcoded variants)
   const autoFilter = findRecommendationFilterUrl($, docsUrl);
-
-  // Step 1b: build full list of candidate filter URLs (auto-detected first, then hardcoded variants)
   const candidates = [autoFilter, ...recommendationFilterCandidates(docsUrl)].filter(
     (u, i, arr) => u && u !== docsUrl && arr.indexOf(u) === i
   );
@@ -511,28 +515,46 @@ async function findEAReportForProject(projectUrl) {
     try {
       await sleep(REQUEST_DELAY_MS);
       const fetched = await fetchAllPages(filterUrl);
-      if (DEBUG_MODE)
-        process.stderr.write(`  [debug] filterUrl=${filterUrl} → ${fetched.length} docs\n`);
+      process.stderr.write(`    [filter] ${filterUrl.replace(/.*\/documents/, "/documents")} → ${fetched.length} docs\n`);
       if (fetched.length > 0) docs = fetched;
-    } catch { /* try next */ }
+    } catch (e) {
+      process.stderr.write(`    [filter] error: ${e.message}\n`);
+    }
   }
 
-  // Step 2: fallback — unfiltered page, keep only Recommendation-stage rows
+  // Step 2: paginate through ALL pages of the unfiltered docs, filter by Recommendation stage
   if (docs.length === 0) {
-    const all = extractAllDocuments($, docsUrl);
-    docs = all.filter((d) => isRecommendationStage(d.stage));
-    if (DEBUG_MODE)
-      process.stderr.write(`  [debug] fallback: ${all.length} total, ${docs.length} recommendation-stage\n`);
+    process.stderr.write(`    [fallback] paginating all unfiltered docs...\n`);
+    const allPaged = await fetchAllPages(docsUrl);
+    process.stderr.write(`    [fallback] total docs across all pages: ${allPaged.length}\n`);
+    docs = allPaged.filter((d) => isRecommendationStage(d.stage));
+    process.stderr.write(`    [fallback] recommendation-stage docs: ${docs.length}\n`);
+
+    // Step 3: if still nothing, score everything from all pages
+    if (docs.length === 0) {
+      docs = allPaged;
+      process.stderr.write(`    [last-resort] scoring all ${docs.length} docs\n`);
+    }
   }
 
-  // Step 3: last resort — score everything (relies on scoring rules to pick the right doc)
-  if (docs.length === 0) {
-    docs = extractAllDocuments($, docsUrl);
-    if (DEBUG_MODE)
-      process.stderr.write(`  [debug] last-resort: ${docs.length} total docs\n`);
+  const result = pickBestDoc(docs);
+
+  // Always show top candidates to aid diagnosis
+  if (!result && docs.length > 0) {
+    const top = docs
+      .map((d) => {
+        const { score } = scoreDocument(d);
+        return { title: d.title, stage: d.stage, score };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+    process.stderr.write(`    [diag] top candidates (none above threshold):\n`);
+    for (const c of top) {
+      process.stderr.write(`      score=${c.score} stage="${c.stage}" title="${c.title}"\n`);
+    }
   }
 
-  return pickBestDoc(docs);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
