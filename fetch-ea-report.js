@@ -45,8 +45,9 @@ const BASE_URL =
   "https://national-infrastructure-consenting.planninginspectorate.gov.uk";
 const SEARCH_URL = `${BASE_URL}/project-search`;
 const DEBUG_MODE = process.argv.includes("--debug");
-const REQUEST_DELAY_MS = 450;
+const REQUEST_DELAY_MS = 1200;   // be polite; 429 means we were too fast
 const MINIMUM_SCORE = 3;
+const SAVE_HTML = process.argv.includes("--save-html");
 const OUTPUT_FILE = path.join(process.cwd(), "ea-reports.json");
 
 // ---------------------------------------------------------------------------
@@ -241,13 +242,35 @@ const httpClient = axios.create({
 });
 
 async function fetchPage(url) {
-  const res = await httpClient.get(url);
-  if (DEBUG_MODE) {
-    const fname = `debug-ea-${url.replace(/[^a-z0-9]/gi, "_").slice(-60)}.html`;
-    fs.writeFileSync(fname, res.data, "utf8");
-    process.stderr.write(`  [debug] saved HTML → ${fname}\n`);
+  const MAX_RETRIES = 5;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    let res;
+    try {
+      res = await httpClient.get(url, { validateStatus: null });
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_RETRIES) await sleep(REQUEST_DELAY_MS * attempt * 2);
+      continue;
+    }
+    if (res.status === 429 || res.status === 503) {
+      const wait = REQUEST_DELAY_MS * Math.pow(2, attempt);
+      process.stderr.write(`    [http] ${res.status} on attempt ${attempt}; retrying in ${wait}ms\n`);
+      await sleep(wait);
+      continue;
+    }
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`HTTP ${res.status} for ${url}`);
+    }
+    if (SAVE_HTML) {
+      const slug = url.replace(/[^a-z0-9]/gi, "_").slice(-80);
+      const fname = path.join(process.cwd(), `debug-html-${slug}.html`);
+      fs.writeFileSync(fname, res.data, "utf8");
+      process.stderr.write(`    [html] saved → ${fname}\n`);
+    }
+    return cheerio.load(res.data);
   }
-  return cheerio.load(res.data);
+  throw lastErr || new Error(`Failed to fetch ${url} after ${MAX_RETRIES} attempts`);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -380,20 +403,23 @@ function extractAllDocuments($, baseUrl) {
 // Filter URL — Recommendation stage
 // ---------------------------------------------------------------------------
 
-function findRecommendationFilterUrl($, docsUrl) {
+function findPlanningDocFilterUrl($, docsUrl) {
   let found = null;
 
-  // 1. Direct anchor whose text is "Recommendation" or "Recommendation (N)"
+  // 1. Look for a "Developer's Application" anchor (or close variants)
   $("a[href]").each((_, el) => {
     if (found) return;
     const text = normaliseText($(el).text());
-    if (/^recommendation(\s*\(\d+\))?$/.test(text)) {
+    if (
+      /^developer.?s?\s+application(\s*\(\d+\))?$/.test(text) ||
+      /^application(\s*\(\d+\))?$/.test(text)
+    ) {
       found = resolveUrl($(el).attr("href"), docsUrl);
     }
   });
   if (found && found !== docsUrl) return found;
 
-  // 2. Form checkbox/radio/option whose value or label contains "recommendation"
+  // 2. Form inputs whose value/label contains "developer" and "application"
   $("form").each((_, form) => {
     if (found) return;
     const $form = $(form);
@@ -403,57 +429,57 @@ function findRecommendationFilterUrl($, docsUrl) {
 
     $form.find("input[type=checkbox], input[type=radio], option").each((_, input) => {
       if (found) return;
-      const val = $(input).attr("value") || "";
-      const valNorm = normaliseText(val);
-      const labelText = normaliseText(
+      const val = normaliseText($(input).attr("value") || "");
+      const label = normaliseText(
         $(input).closest("label").text() ||
         $(`label[for='${$(input).attr("id")}']`).text() ||
         $(input).parent().text()
       );
-
-      const isEAReport =
-        valNorm.includes("examining authority") && valNorm.includes("recommendation");
-      const isRecommendation =
-        valNorm === "recommendation" || /^recommendation(\s*\(\d+\))?$/.test(labelText);
-
-      if (isEAReport || isRecommendation) {
+      const text = val || label;
+      if (text.includes("developer") && text.includes("application")) {
         const inputName = $(input).attr("name") || "stage";
         const params = new URLSearchParams();
-        params.append(inputName, val || "recommendation");
+        params.append(inputName, $(input).attr("value") || "Developer's Application");
         const sep = action.includes("?") ? "&" : "?";
-        const candidate = `${action}${sep}${params.toString()}`;
-        if (isEAReport || !found) found = candidate;
+        found = `${action}${sep}${params.toString()}`;
       }
     });
   });
   if (found && found !== docsUrl) return found;
 
-  // 3. Hardcoded fallbacks — try all known NSIP document-type strings
-  //    The NSIP site uses ?stage-recommendation=<exact document type label>
-  const base = docsUrl.split("?")[0];
-  // Return the most specific known value; we'll try alternates in the caller
-  return `${base}?stage-recommendation=` +
-    encodeURIComponent("Examining Authority's Report to the Secretary of State");
+  return null;  // caller will use hardcoded candidates
 }
 
-/** All known filter URL variants for the Recommendation stage. */
-function recommendationFilterCandidates(docsUrl) {
+/** All known filter URL variants for Developer's Application > Other Documents. */
+function planningDocFilterCandidates(docsUrl) {
   const base = docsUrl.split("?")[0];
-  // Try both the long document-type value form AND simple stage= forms
-  const longTypes = [
-    "Examining Authority's Report to the Secretary of State",
-    "Examining Authority's Recommendation Report",
-    "Recommendation Report",
-    "Examining Authority's Report",
-  ].map((t) => `${base}?stage-recommendation=${encodeURIComponent(t)}`);
 
-  const simpleTypes = [
-    `${base}?stage=recommendation`,
-    `${base}?stage=Recommendation`,
-    `${base}?stage-recommendation=recommendation`,
+  // The NSIP portal uses ?stage-<slug>=<document-type-label>
+  // "Developer's Application" is stage slug "developers-application" or "developer-application"
+  // The sub-category is "Other Documents"
+  const stageSlugVariants = [
+    "developers-application",
+    "developer-application",
+    "developer",
+    "application",
+    "pre-application",
+  ];
+  const docTypeVariants = [
+    "Other Documents",
+    "Other",
   ];
 
-  return [...longTypes, ...simpleTypes];
+  const paramVariants = [];
+  for (const slug of stageSlugVariants) {
+    for (const dtype of docTypeVariants) {
+      paramVariants.push(`${base}?stage-${slug}=${encodeURIComponent(dtype)}`);
+    }
+    // Also try just the stage with no sub-type
+    paramVariants.push(`${base}?stage-${slug}=`);
+    paramVariants.push(`${base}?stage=${encodeURIComponent("Developer's Application")}`);
+  }
+
+  return [...new Set(paramVariants)];
 }
 
 // ---------------------------------------------------------------------------
@@ -503,8 +529,8 @@ async function findEAReportForProject(projectUrl) {
   }
 
   // Step 1: try all filter URL candidates (auto-detected from DOM + hardcoded variants)
-  const autoFilter = findRecommendationFilterUrl($, docsUrl);
-  const candidates = [autoFilter, ...recommendationFilterCandidates(docsUrl)].filter(
+  const autoFilter = findPlanningDocFilterUrl($, docsUrl);
+  const candidates = [autoFilter, ...planningDocFilterCandidates(docsUrl)].filter(
     (u, i, arr) => u && u !== docsUrl && arr.indexOf(u) === i
   );
 
